@@ -1,0 +1,275 @@
+(ns main
+  (:require [io.pedestal.http :as http]
+            [io.pedestal.http.route :as route]
+            [io.pedestal.test :as test]))
+
+;;
+;; Atom for a reference to the  dev server instance
+(defonce server (atom nil))
+
+;;
+;;==================================================
+;; Database functions
+;;==================================================
+;; 
+;; In memory repository
+(defonce database (atom {}))
+
+;;
+;; Find list of given id in databse
+;;
+(defn find-list-by-id
+  "Given a database ad list id, find the list"
+  [db list-id]
+  (get db list-id))
+
+;;
+;; Find the item from a specified list and item id
+(defn find-list-item-by-id
+  "Given a database, a list id and an item id, find the item"
+  [db list-id list-item-id]
+  (-> db
+      (find-list-by-id list-id)
+      (get-in [:items list-item-id])))
+
+
+
+
+;;
+;;==================================================
+;; Response generation functions
+;;==================================================
+;; 
+
+;; The response map desribes the outgoing HTTP response
+;; and is attached to the context map. Can be created/updated
+;; by any interceptor in the chain. If none is created after
+;; after the interceptor processing is complete, the
+;; Pedestal will generate a 404.
+(defn response-map
+  "Creates a response map from the the specifed 
+  status, body and eventual headers provided"
+  [status body & {:as headers}]
+  {:status status
+   :body body
+   :headers headers})
+
+
+;;
+;; Partial functions for a responses
+;; 200 - The request has succeeded. (GET, POST, HEAD, TRACE) 
+(def ok (partial response-map 200))
+
+;; 201 - The request has been fulfilled and resulted in a new resource being created. 
+(def created (partial response-map 201))
+
+;; 202 - The request has been accepted for processing, but the processing has not been
+;; completed.
+;; The 202 response is intentionally non-committal.
+(def accepted (partial response-map 202))
+
+;;
+;; Echo handler for testing routes
+(def echo
+  {:name :echo
+   :enter (fn [context]
+            (->> context
+                 (ok)
+                 (assoc context :response)))})
+
+
+
+
+;;
+;;==================================================
+;; Domain functions
+;;==================================================
+;; 
+
+(defn new-list
+  "Create a new list. A list holds todo items. 
+   The lists are idenfied by name"
+  [name]
+  {:name name
+   :items {}})
+
+
+(defn new-list-item
+  "Create a new to-do item"
+  [name]
+  {:name name
+   :done? false})
+
+;;
+;;=========================================
+;; Interceptors
+;;=========================================
+
+;;
+;; Generic interceptor for reading results
+;; and creating an OK response
+(def response-generator
+  {:name :result-response-intc
+   :leave (fn [context]
+            (if-let [result (:result context)]
+              (assoc context :response (ok result))
+              context))})
+
+
+;;
+;; The database interceptor the responsibility to implement
+;; generic tasks related to the database.
+;;
+;; Implements 2 tasks
+;; 1: attach the database reference to the request 
+;; 2: Execute transactions 
+(def db-intc
+  {:name :dabase-interceptor
+   :enter (fn [context]
+            (update context :request assoc :database @database))
+   :leave (fn [context]
+            (if-let [[op & args] (:tx-data context)]
+              (do
+                (apply swap! database op args)
+                (println "++++> DB: " op " on " args)
+                (assoc-in context [:request :database] @database))
+              context))})
+
+
+;;
+;; Inteceptor for creatin a new tod-list
+;; Creates a new todo list and places it into the context to gether with
+;; the id and operation "assoc" required to associiate it with.
+
+;; to be executed by the interceptor to bind it to the id :tx-data into the context.
+(def new-list-view-intc
+  {:name :new-list-view
+   :enter (fn [context]
+            (let [name (get-in context [:request :query-params :name] "<No name>")
+                  new-list (new-list name)
+                  list-id (str (gensym "l"))
+                  url (route/url-for :list-view :params {:list-id list-id})]
+              (assoc context
+                     :response (created new-list "Location" url)
+                     :tx-data [assoc list-id new-list])))})
+
+
+
+
+;;
+;; Interceptor for handling the :list-view request "/todo/:list-id"
+;; Checks if a :list-d exists in the path parameters
+;; - then fetches the list from the database
+;; - and finally associates the list with the :result key in the context
+;;
+(def list-view-intc
+  {:name :list-view
+   :enter (fn [context]
+            (if-let [list-id (get-in context [:request :path-params :list-id])]
+              (if-let [list (find-list-by-id (get-in context [:request :database]) list-id)]
+                (assoc context :result list)
+                context)
+              context))})
+
+
+;;
+;; Supporting fucntion
+(defn add-item-to-list
+  "Expects an associative database, a list and a new item then 
+   adds the item to the list in an asociative database value and returns the database"
+  [db list-id item-id item]
+  (if (contains? db list-id)
+    (assoc-in db [list-id :items item-id] item)
+    db))
+
+
+;;
+;; Interceptor for creating lits itm views after
+;; lookup or creation: the last interceptor places
+;; a list-id and s list-item-id in the request :path-params map
+;;
+(def list-item-result-creator
+  {  :name :list-item-result-creator
+     :leave (fn [context]
+             (if-let [list-id (get-in context [:request :path-params :list-id])]
+               (if-let [item-id (get-in context [:request :path-params :item-id])]
+                 (if-let [item (find-list-item-by-id (get-in context [:request :database]) list-id item-id)]
+                   (assoc context :result item)
+                   context)
+                 context)
+               context))})
+
+;;
+;; Interceptor for creating new list items
+;;
+(def new-list-item-view-intc
+  {:name :new-list-item-view
+   :enter (fn [context]
+            (if-let [list-id (get-in context [:request :path-params :list-id])]
+              (let [item-name (get-in context [:request :query-params :name] "No name")
+                    new-item (new-list-item item-name)
+                    item-id (str (gensym "i"))]
+                (assoc context :tx-data [add-item-to-list list-id item-id new-item])
+                (assoc-in context [:request :path-params :item-id] item-id))
+              context))})
+
+ 
+;;
+;; Routes
+(def routes
+  (route/expand-routes
+   #{["/todo"                   :post   [db-intc new-list-view-intc]]
+     ["/todo"                   :get    echo :route-name :list-query-form]
+     ["/todo/:list-id"          :get    [response-generator db-intc list-view-intc]]
+     ["/todo/:list-id"          :post   [response-generator list-item-result-creator db-intc new-list-item-view-intc]]
+     ["/todo/:list-id/:item-id" :get    echo :route-name :list-item-view]
+     ["/todo/:list-id/:item-id" :put    echo :route-name :list-item-update]
+     ["/todo/:list-id/:item-id" :delete echo :route-name :list-tems-delete]}))
+
+
+;;
+;; The service map  provides a configuration for the server
+(def service-map
+  {::http/routes routes
+   ::http/type :jetty
+   ::http/port 8890})
+
+;;
+;; PROD start function
+(defn start-prod
+  []
+  (http/start
+   (http/create-server service-map)))
+
+
+;;
+;; DEV start function
+(defn start-dev
+  "Join?=false tells Pedestal not to block the thread that starts the 
+   thread that starts the web server and wait for the server to exit. 
+   join?=true to wait"
+  []
+  (reset! server
+          (http/start
+           (http/create-server
+            (assoc service-map
+                   ::http/join? false)))))
+
+
+(defn stop-dev
+  "Stop  the dev server"
+  []
+  (http/stop @server))
+
+
+(defn restart-dev
+  "Restart dev server"
+  []
+  (stop-dev)
+  (start-dev))
+
+
+(defn test-request
+  "Test routing"
+  [verb url]
+  (test/response-for (::http/service-fn @server) verb url))
